@@ -1,0 +1,76 @@
+name: HOL Guard integration validation
+
+on:
+  push:
+    branches:
+      - validation/hol-guard-security-analyzer
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install OpenHands workspace
+        run: uv sync --frozen
+
+      - name: Install HOL Guard
+        run: uv pip install --python .venv/bin/python --prerelease=allow hol-guard
+
+      - name: Validate analyzer against real HOL Guard CLI
+        run: |
+          .venv/bin/python - <<'PY'
+          import importlib.util
+          import json
+          from pathlib import Path
+
+          from openhands.sdk.event import ActionEvent
+          from openhands.sdk.llm import MessageToolCall, TextContent
+          from openhands.sdk.security.risk import SecurityRisk
+          from openhands.tools.terminal import TerminalAction
+
+          module_path = Path("examples/01_standalone_sdk/43_hol_guard_security_analyzer.py")
+          spec = importlib.util.spec_from_file_location("hol_guard_example", module_path)
+          assert spec is not None and spec.loader is not None
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+
+          def event(command: str) -> ActionEvent:
+              return ActionEvent(
+                  thought=[TextContent(text="integration validation")],
+                  action=TerminalAction(command=command),
+                  tool_name="terminal",
+                  tool_call_id="hol-guard-validation",
+                  tool_call=MessageToolCall(
+                      id="hol-guard-validation",
+                      name="terminal",
+                      arguments=json.dumps({"command": command}),
+                      origin="completion",
+                  ),
+                  llm_response_id="hol-guard-validation",
+              )
+
+          analyzer = module.HolGuardSecurityAnalyzer(workspace=".")
+          safe = analyzer.security_risk(event("pwd"))
+          risky = analyzer.security_risk(event("rm -rf /tmp/openhands-hol-guard-demo"))
+          missing = module.HolGuardSecurityAnalyzer(
+              guard_executable="definitely-missing-hol-guard",
+              workspace=".",
+          ).security_risk(event("pwd"))
+
+          print(f"pwd => {safe.value}")
+          print(f"rm -rf => {risky.value}")
+          print(f"missing hol-guard => {missing.value}")
+
+          assert safe == SecurityRisk.LOW
+          assert risky == SecurityRisk.HIGH
+          assert missing == SecurityRisk.HIGH
+          PY
